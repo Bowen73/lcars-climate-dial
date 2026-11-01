@@ -38,6 +38,8 @@ struct Input {
   float set_temp = 22, cur_temp = NAN;  // degrees; cur_temp NAN = unknown
   float min_temp = 16, max_temp = 32;
   bool on = false;                       // air con running
+  bool schedule_known = false, schedule_enabled = false;
+  bool frost = false;                    // HA heating enabled at the 7 C frost target
   Action action = IDLE;
   const char *mode = "AUTO";             // shown when idle
   bool adjusting = false;
@@ -59,7 +61,7 @@ struct Ui {
   int gauge_start[GAUGE_BLOCKS];
   int gauge_sweep = 0;
   lv_color_t gauge_color[GAUGE_BLOCKS];
-  lv_obj_t *status, *underline, *num, *now_lbl, *marker, *track, *sleep_layer, *sleep_lbl;
+  lv_obj_t *status, *underline, *num, *now_lbl, *marker, *track, *sleep_layer, *sleep_lbl, *sleep_status, *sleep_detail;
   bool asleep = false;
   float sleep_last = -999;
   float shown_cur = -1;
@@ -381,6 +383,8 @@ inline void build(lv_obj_t *parent, const Fonts &f) {
   lv_obj_set_style_text_font(ui.sleep_lbl, f.huge, 0);
   lv_label_set_text(ui.sleep_lbl, "--");
   lv_obj_center(ui.sleep_lbl);
+  ui.sleep_status = text(ui.sleep_layer, f.med, LILAC, 0, 68, "SYNCING", false);
+  ui.sleep_detail = text(ui.sleep_layer, f.med, LILAC, 0, 91, "", false);
   lv_obj_add_flag(ui.sleep_layer, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -472,6 +476,16 @@ inline void tick(const Input &in) {
 
   // Asleep: only the room temperature needs keeping up to date
   if (ui.asleep) {
+    const char *sleep_status = !in.linked ? "NO LINK" : !in.schedule_known ? "SYNCING" :
+        !in.schedule_enabled ? "SCHEDULE OFF" : in.action == HEATING ? "HEATING" : "IDLE";
+    const char *detail = !in.linked || !in.schedule_known ? "" :
+        !in.schedule_enabled ? "FROST ONLY 7\xC2\xB0" "C" : in.frost ? "FROST 7\xC2\xB0" "C" : "SCHEDULE ON";
+    if (strcmp(lv_label_get_text(ui.sleep_detail), detail) != 0)
+      lv_label_set_text(ui.sleep_detail, detail);
+    if (strcmp(lv_label_get_text(ui.sleep_status), sleep_status) != 0)
+      lv_label_set_text(ui.sleep_status, sleep_status);
+    lv_obj_set_style_text_color(ui.sleep_status,
+        lv_color_hex(!in.linked ? RED : in.frost && in.action == HEATING ? ORANGE : LILAC), 0);
     float cur = std::isnan(in.cur_temp) ? -999 : in.cur_temp;
     if (cur != ui.sleep_last) {
       ui.sleep_last = cur;
@@ -686,9 +700,15 @@ inline void tick(const Input &in) {
   } else if (in.adjusting) {
     status = "ADJUST";
     color = GOLD;
+  } else if (!in.schedule_known) {
+    status = "SYNCING";
+    color = LILAC;
   } else if (!in.on) {
-    status = "AC OFF";
+    status = in.frost ? (in.action == HEATING ? "FROST HEAT" : "FROST") : "OFF";
     color = 0x7766AA;
+  } else if (in.frost && in.action != HEATING) {
+    status = "FROST";
+    color = LILAC;
   } else if (in.action == HEATING) {
     status = "HEATING";
     color = 0xFF8844;

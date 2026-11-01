@@ -6,6 +6,19 @@
 # with Home Assistant state, and calls knob_step, knob_press and fan_open from the knob.
 
 globals:
+  - id: schedule_enabled
+    type: bool
+    initial_value: 'false'
+  - id: schedule_known
+    type: bool
+    initial_value: 'false'
+  - id: last_comfort_temperature
+    type: float
+    restore_value: true
+    initial_value: '20.0'
+  # Reported activity, distinct from the selected heat/cool mode. Never restore stale activity.
+  - id: ha_hvac_action
+    type: std::string
   - id: set_temp
     type: float
     initial_value: "22"
@@ -186,6 +199,13 @@ script:
             lambda: return lcars_setup::active();
           then:
             - script.stop: knob_step
+      # Off is a persistent schedule lock. Turning only brightens the frost screen.
+      - if:
+          condition:
+            lambda: return !id(schedule_known) || !id(schedule_enabled);
+          then:
+            - script.execute: wake_screen
+            - script.stop: knob_step
       # Fan page open: turning steps through the fan speeds instead
       - if:
           condition:
@@ -229,7 +249,7 @@ script:
       # Nothing to control while a setup screen is up
       - if:
           condition:
-            lambda: return lcars_setup::active();
+            lambda: return lcars_setup::active() || !id(schedule_known);
           then:
             - script.stop: knob_press
       # Fan page open: a press just closes it
@@ -246,13 +266,7 @@ script:
           id(resync_pending) = true;
           lcars_ac::flash();
       - script.execute: send_power
-      - if:
-          condition:
-            lambda: return id(ac_on);
-          then:
-            - script.execute: wake_screen
-          else:
-            - script.execute: sleep_now
+      - script.execute: wake_screen
 
   # Home Assistant state. Held back briefly after a local change so the dial doesn't
   # jump back while the climate catches up, then applied (resync_pending) so a command
@@ -265,7 +279,7 @@ script:
           id(ha_last_mode) = mode;
           if (millis() - id(local_change_ms) < 4000) return;
           id(hvac_mode) = mode;
-          id(ac_on) = mode != "off" && mode != "unavailable" && mode != "unknown";
+          id(ac_on) = id(schedule_known) && id(schedule_enabled) && mode != "unavailable" && mode != "unknown";
           if (id(ac_on)) id(last_on_mode) = mode;
   - id: ha_set_temp
     parameters:
@@ -274,6 +288,7 @@ script:
       - lambda: |-
           if (std::isnan(t)) return;
           id(ha_last_set) = t;
+          if (t > 7.05f) id(last_comfort_temperature) = t;
           if (millis() - id(local_change_ms) < 4000) return;
           id(set_temp) = t;
   - id: ha_cur_temp
@@ -322,25 +337,23 @@ script:
           id(fan_active) = false;
           lcars_ac::set_fan(false, 0, id(fan_modes));
 
-  # Full display on any interaction. It stays awake while the air con is on; once
-  # it's off and the knob has been left alone, it sleeps showing just the room temperature.
+  # Bright for one minute after interaction or a new heating demand.
+  # Schedule off keeps the clear frost-only screen, even when brightened.
   - id: wake_screen
     mode: restart
     then:
       - lambda: |-
           bool was_asleep = id(asleep);
-          id(asleep) = false;
+          id(asleep) = !id(schedule_known) || !id(schedule_enabled);
           if (id(ui_ready)) {
-            lcars_ac::set_sleep(false);
-            // Woken by the air con coming on: build the display up
-            if (was_asleep && id(ac_on)) lcars_ac::boot();
+            lcars_ac::set_sleep(id(asleep));
+            if (was_asleep && !id(asleep)) lcars_ac::boot();
           }
       - script.execute: { id: set_backlight, level: 1.0 }
-      - delay: ${screen_idle_after}
-      - wait_until:
-          condition:
-            lambda: return !id(ac_on);
-      - script.execute: sleep_now
+      - delay: 60s
+      - script.execute:
+          id: set_backlight
+          level: !lambda 'return lcars_setup::active() ? 1.0f : ${sleep_brightness};'
 
   - id: sleep_now
     then:
@@ -377,7 +390,7 @@ interval:
             if (!m.empty()) {
               bool on = m != "off" && m != "unavailable" && m != "unknown";
               id(hvac_mode) = m;
-              id(ac_on) = on;
+              id(ac_on) = on && id(schedule_known) && id(schedule_enabled);
               if (on) id(last_on_mode) = m;
             }
             if (!std::isnan(id(ha_last_set))) id(set_temp) = id(ha_last_set);
@@ -387,19 +400,31 @@ interval:
             id(send_fan_mode).execute();
           }
           lcars_ac::Input in;
+          const bool frost = id(ha_last_mode) == "heat" &&
+              !std::isnan(id(ha_last_set)) && id(ha_last_set) <= 7.05f;
+          const bool was_on = id(ac_on);
+          if (millis() - id(local_change_ms) >= 4000) {
+            const auto &mode = id(ha_last_mode);
+            id(ac_on) = id(schedule_known) && id(schedule_enabled) && !mode.empty() &&
+                mode != "unknown" && mode != "unavailable";
+          }
+          // A scheduled setpoint change can resume comfort without a mode change.
+          if (!was_on && id(ac_on) && id(asleep)) id(wake_screen).execute();
+          in.frost = frost;
+          in.schedule_known = id(schedule_known);
+          in.schedule_enabled = id(schedule_enabled);
           in.set_temp = id(set_temp);
           in.cur_temp = id(cur_temp);
           in.min_temp = id(temp_min);
           in.max_temp = id(temp_max);
           in.on = id(ac_on);
-          const std::string &m = id(hvac_mode);
-          // The unit doesn't report what it's doing, so infer it from the mode and temperatures
-          float diff = std::isnan(id(cur_temp)) ? 0 : id(set_temp) - id(cur_temp);
-          if (m == "heat") in.action = lcars_ac::HEATING;
-          else if (m == "cool") in.action = lcars_ac::COOLING;
-          else if (m == "heat_cool" || m == "auto") in.action = diff > 0.5f ? lcars_ac::HEATING : diff < -0.5f ? lcars_ac::COOLING : lcars_ac::IDLE;
+          // Use HA's actual activity: mode and temperature cannot account for hysteresis.
+          const std::string &action = id(ha_hvac_action);
+          if (action == "heating") in.action = lcars_ac::HEATING;
+          else if (action == "cooling") in.action = lcars_ac::COOLING;
+          else if (action == "idle" || action == "off") in.action = lcars_ac::IDLE;
           else in.action = lcars_ac::OTHER;
-          in.mode = m == "dry" ? "DRY" : m == "fan_only" ? "FAN" : (m == "heat_cool" || m == "auto") ? "HOLDING" : "AUTO";
+          in.mode = in.action == lcars_ac::IDLE ? "IDLE" : action == "drying" ? "DRY" : action == "fan" ? "FAN" : "UNKNOWN";
           in.adjusting = id(last_turn_ms) != 0 && millis() - id(last_turn_ms) < 1200;
           in.linked = id(ha_linked);
           in.fan = id(fan_active);

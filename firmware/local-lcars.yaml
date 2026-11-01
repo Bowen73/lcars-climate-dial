@@ -1,0 +1,5 @@
+# Local build wrapper. The original project and settings remain in the included file.
+packages:
+  firmware: !include lcars-climate-dial.yaml
+esphome:
+  build_path: !env_var LCARS_BUILD_DIR
